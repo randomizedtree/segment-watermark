@@ -1,0 +1,18 @@
+__pycache__
+output*
+
+# venv
+bin/
+lib
+lib/
+lib64
+lib64/
+pyvenv.cfg
+
+# cpp compiled files and temp files
+balance_hash/dp_balance
+balance_hash/res_len.txt
+balance_hash/freq_shuffled.txt
+
+# cpp compiled files
+robust_bound/build/

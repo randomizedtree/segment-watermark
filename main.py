@@ -116,6 +116,9 @@ def main(args):
     elif args.model_name == 'falcon':
         model_name = 'tiiuae/falcon-7b'
         adapters_name = None
+    else:
+        model_name = args.model_name
+        adapters_name = None
     # elif args.model_name == 'vicuna':
     #     model_name = 'lmsys/vicuna-7b-v1.5'
     #     adapters_name = None
@@ -268,13 +271,36 @@ def main(args):
         results_orig = results_orig[left:right]
 
     # evaluate
+    # evaluate
     results, corr_payloads = load_res_payload(json_path=os.path.join(args.output_dir, f"results.jsonl"), nsamples=args.nsamples, result_key="result")
+    
+    # === 新增：评分阶段的断点续传逻辑 ===
+    score_start_point = 0
+    score_file_path = os.path.join(args.output_dir, 'scores.jsonl')
     log_stats = []
-    text_index = left if args.split is not None else 0
-    all_times = []
     decoded_payloads = []
-    with open(os.path.join(args.output_dir, 'scores.jsonl'), 'w') as f:
-        for text, text_orig in tqdm.tqdm(zip(results, results_orig)):
+
+    # 如果有历史评分，读取并恢复状态
+    if os.path.exists(score_file_path):
+        with open(score_file_path, 'r') as f:
+            for line in f:
+                data = json.loads(line)
+                # 恢复 log_stats
+                short_log = {k: data[k] for k in ['text_index', 'num_token', 'score', 'payload'] if k in data}
+                if 'zscore' in data: short_log['zscore'] = data['zscore']
+                if 'pvalue' in data: short_log['pvalue'] = data['pvalue']
+                log_stats.append(short_log)
+                # 恢复 payloads
+                decoded_payloads.append(data['payload'])
+                score_start_point += 1
+    print(f"Scoring starting from index {score_start_point}")
+
+    text_index = (left if args.split is not None else 0) + score_start_point
+    all_times = []
+    
+    # === 注意：将 'w' 覆盖模式改为了 'a' 追加模式，并切片跳过已经处理的数据 ===
+    with open(score_file_path, 'a') as f:
+        for text, text_orig in tqdm.tqdm(list(zip(results, results_orig))[score_start_point:]):
             time0 = time.time()
             # compute watermark score
             if args.method_detect in ["rs", "rsbh", "bch"]:

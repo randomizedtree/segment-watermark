@@ -88,7 +88,8 @@ class Generalized_Reed_Solomon(basereedsolomon.Base_Reed_Solomon):
         for f_index in range(0,self.p):
             f_i = gl.Poly(fft[f_index],field=self.galois_field)
             self.helper.debug_print("fi",f_i,fft[f_index],f_i% self.generator_set[f_index] )
-            f_values.append((f_i % self.generator_set[f_index]).coeffs.tolist())
+            coeffs = (f_i % self.generator_set[f_index]).coeffs.tolist()
+            f_values.append([0] * (l - len(coeffs)) + coeffs)
 
         
         

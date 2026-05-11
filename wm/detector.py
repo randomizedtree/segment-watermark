@@ -1,6 +1,5 @@
 from typing import List
 import numpy as np
-from numpy._core.multiarray import array as array
 from scipy import special
 import torch
 from transformers import LlamaTokenizer
@@ -21,7 +20,7 @@ class WmDetector():
         ):
         # model config
         self.tokenizer = tokenizer
-        self.vocab_size = self.tokenizer.vocab_size
+        self.vocab_size = len(self.tokenizer)
         # watermark config
         self.ngram = ngram
         self.salt_key = salt_key
@@ -30,10 +29,46 @@ class WmDetector():
         self.seeding = seeding 
         self.rng = torch.Generator()
         self.rng.manual_seed(self.seed)
+        self.detect_device = device
+        self._candidate_offsets_cache = {}
 
     def hashint(self, integer_tensor: torch.LongTensor) -> torch.LongTensor:
         """Adapted from https://github.com/jwkirchenbauer/lm-watermarking"""
         return self.hashtable[integer_tensor.cpu() % len(self.hashtable)] 
+
+    def supports_score_tok_candidates(self) -> bool:
+        return False
+
+    def score_tok_candidates(self, ngram_tokens: List[int], token_id: int, candidate_count: int):
+        raise NotImplementedError
+
+    def _use_device_scoring(self) -> bool:
+        return self.detect_device.type == "cuda" and self.supports_score_tok_candidates()
+
+    def _candidate_offsets(self, candidate_count: int) -> torch.Tensor:
+        key = (self.detect_device.type, self.detect_device.index, int(candidate_count))
+        offsets = self._candidate_offsets_cache.get(key)
+        if offsets is None:
+            offsets = torch.arange(candidate_count, device=self.detect_device, dtype=torch.long)
+            self._candidate_offsets_cache[key] = offsets
+        return offsets
+
+    def _greenlist_scores_on_device(
+        self,
+        greenlist: torch.Tensor,
+        token_id: int,
+        r_length: int,
+        candidate_count: int,
+    ) -> torch.Tensor:
+        """
+        Equivalent to ``scores.roll(-token_id)[:candidate_count]`` for binary
+        greenlist scores, while keeping the RNG-produced greenlist on CPU.
+        """
+        effective_count = min(int(candidate_count), int(r_length))
+        green_mask = torch.zeros(r_length, device=self.detect_device)
+        green_mask[greenlist.to(self.detect_device, non_blocking=True)] = 1
+        candidates = (self._candidate_offsets(effective_count) + int(token_id)) % int(r_length)
+        return green_mask[candidates]
     
     def get_seed_rng(self, input_ids: List[int]) -> int:
         """
@@ -146,7 +181,11 @@ class WmDetector():
         for ii in range(bsz):
             total_len = len(tokens_id[ii])
             start_pos = self.ngram +1
-            rt_aggr = torch.zeros(payload_max) # init aggregate scores as all 0
+            use_device_scoring = self._use_device_scoring()
+            if use_device_scoring:
+                rt_aggr = torch.zeros(payload_max, device=self.detect_device) # init aggregate scores as all 0
+            else:
+                rt_aggr = torch.zeros(payload_max) # init aggregate scores as all 0
             seen_ntuples = set()
             for cur_pos in range(start_pos, total_len):
                 ngram_tokens = tokens_id[ii][cur_pos-self.ngram:cur_pos] # h
@@ -160,10 +199,13 @@ class WmDetector():
                     if tup_for_unique in seen_ntuples:
                         continue
                     seen_ntuples.add(tup_for_unique)
-                rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
-                rt = rt[:payload_max] # rt: contribution of token t on each payloads
+                if use_device_scoring:
+                    rt = self.score_tok_candidates(ngram_tokens, tokens_id[ii][cur_pos], payload_max)
+                else:
+                    rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
+                    rt = rt[:payload_max] # rt: contribution of token t on each payloads
                 rt_aggr += rt # add contribution of token t to rt_aggr
-            score_lists.append(rt_aggr.numpy())
+            score_lists.append(rt_aggr.cpu().numpy())
             ntoks_arr.append(total_len - start_pos) 
         return score_lists, np.asarray(ntoks_arr) 
 
@@ -250,6 +292,20 @@ class MarylandDetector(WmDetector):
         super().__init__(tokenizer, ngram, seed, seeding, salt_key, **kwargs)
         self.gamma = gamma
         self.delta = delta
+
+    def supports_score_tok_candidates(self) -> bool:
+        return True
+
+    def _score_r_length(self) -> int:
+        return self.vocab_size
+
+    def score_tok_candidates(self, ngram_tokens: List[int], token_id: int, candidate_count: int):
+        seed = self.get_seed_rng(ngram_tokens)
+        self.rng.manual_seed(seed)
+        r_length = self._score_r_length()
+        vocab_permutation = torch.randperm(r_length, generator=self.rng)
+        greenlist = vocab_permutation[:int(self.gamma * r_length)]
+        return self._greenlist_scores_on_device(greenlist, token_id, r_length, candidate_count)
     
     def score_tok(self, ngram_tokens, token_id):
         """ 
@@ -287,6 +343,20 @@ class MarylandDetectorZ(WmDetector):
         super().__init__(tokenizer, ngram, seed, seeding, salt_key, **kwargs)
         self.gamma = gamma
         self.delta = delta
+
+    def supports_score_tok_candidates(self) -> bool:
+        return True
+
+    def _score_r_length(self) -> int:
+        return self.vocab_size
+
+    def score_tok_candidates(self, ngram_tokens: List[int], token_id: int, candidate_count: int):
+        seed = self.get_seed_rng(ngram_tokens)
+        self.rng.manual_seed(seed)
+        r_length = self._score_r_length()
+        vocab_permutation = torch.randperm(r_length, generator=self.rng)
+        greenlist = vocab_permutation[:int(self.gamma * r_length)]
+        return self._greenlist_scores_on_device(greenlist, token_id, r_length, candidate_count)
     
     def score_tok(self, ngram_tokens, token_id):
         """ same as MarylandDetector but using zscore """
@@ -372,6 +442,9 @@ class MarylandDetectorE(MarylandDetector):
         super().__init__(*args, **kwargs)
         self.payload_max = payload_max
 
+    def _score_r_length(self) -> int:
+        return max(self.payload_max, self.vocab_size)
+
     def score_tok(self, ngram_tokens, token_id):
         seed = self.get_seed_rng(ngram_tokens)
         self.rng.manual_seed(seed)
@@ -446,8 +519,12 @@ class BCHDecoder(MarylandDetector):
         for ii in range(bsz):
             total_len = len(tokens_id[ii])
             start_pos = self.ngram +1
+            use_device_scoring = self._use_device_scoring()
             # aggr scores for each payload segments
-            rt_aggr_list = [torch.zeros(2 ** self.segment_bit) for i in range(self.segments_num)]
+            if use_device_scoring:
+                rt_aggr_list = [torch.zeros(2 ** self.segment_bit, device=self.detect_device) for i in range(self.segments_num)]
+            else:
+                rt_aggr_list = [torch.zeros(2 ** self.segment_bit) for i in range(self.segments_num)]
             seen_ntuples = set()
             for cur_pos in range(start_pos, total_len):
                 ngram_tokens = tokens_id[ii][cur_pos-self.ngram:cur_pos] # h
@@ -461,8 +538,11 @@ class BCHDecoder(MarylandDetector):
                     if tup_for_unique in seen_ntuples:
                         continue
                     seen_ntuples.add(tup_for_unique)
-                rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
-                rt = rt[:(2**self.segment_bit)] # rt: contribution of token t on each payloads
+                if use_device_scoring:
+                    rt = self.score_tok_candidates(ngram_tokens, tokens_id[ii][cur_pos], 2 ** self.segment_bit)
+                else:
+                    rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
+                    rt = rt[:(2**self.segment_bit)] # rt: contribution of token t on each payloads
 
                 # assign current token to m1 or m2
                 random_int = torch.randint(low=0, high=self.segments_num, size=(1,), generator=self.rng).item() 
@@ -471,7 +551,7 @@ class BCHDecoder(MarylandDetector):
                 random_int_list.append(random_int)
 
             for i in range(self.segments_num):
-                score_lists[ii].append(rt_aggr_list[i].numpy())
+                score_lists[ii].append(rt_aggr_list[i].cpu().numpy())
             # num of scores vecctor being sumed is (total_len - 1 - start_pos + 1 = total_len - start_pos)
             ntoks_arr.append(total_len - start_pos) 
         return score_lists, np.asarray(ntoks_arr), random_int_list
@@ -541,7 +621,8 @@ class RSDecoder(MarylandDetector):
             message_length=self.gf_segments_num,   # n
             payload_length=self.segments_num,      # k
             symbol_size=self.segment_bit,          # m
-            p_factor=1
+            p_factor=1,
+            debug=False
         )
 
     def score_tok(self, ngram_tokens, token_id):
@@ -571,8 +652,12 @@ class RSDecoder(MarylandDetector):
         for ii in range(bsz):
             total_len = len(tokens_id[ii])
             start_pos = self.ngram +1
+            use_device_scoring = self._use_device_scoring()
             # aggr scores for each payload segments
-            rt_aggr_list = [torch.zeros(2 ** self.segment_bit) for i in range(self.gf_segments_num)]
+            if use_device_scoring:
+                rt_aggr_list = [torch.zeros(2 ** self.segment_bit, device=self.detect_device) for i in range(self.gf_segments_num)]
+            else:
+                rt_aggr_list = [torch.zeros(2 ** self.segment_bit) for i in range(self.gf_segments_num)]
             seen_ntuples = set()
             for cur_pos in range(start_pos, total_len):
                 ngram_tokens = tokens_id[ii][cur_pos-self.ngram:cur_pos] # h
@@ -586,8 +671,11 @@ class RSDecoder(MarylandDetector):
                     if tup_for_unique in seen_ntuples:
                         continue
                     seen_ntuples.add(tup_for_unique)
-                rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
-                rt = rt[:(2**self.segment_bit)] # rt: contribution of token t on each payloads
+                if use_device_scoring:
+                    rt = self.score_tok_candidates(ngram_tokens, tokens_id[ii][cur_pos], 2 ** self.segment_bit)
+                else:
+                    rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
+                    rt = rt[:(2**self.segment_bit)] # rt: contribution of token t on each payloads
                 # determine which segment current token is embedding
                 random_int = torch.randint(low=0, high=self.gf_segments_num, size=(1,), generator=self.rng).item() 
                 rt_aggr_list[random_int] += rt
@@ -595,7 +683,7 @@ class RSDecoder(MarylandDetector):
                 random_int_list.append(random_int)
 
             for i in range(self.gf_segments_num):
-                score_lists[ii].append(rt_aggr_list[i].numpy())
+                score_lists[ii].append(rt_aggr_list[i].cpu().numpy())
             # num of scores vecctor being sumed is (total_len - 1 - start_pos + 1 = total_len - start_pos)
             ntoks_arr.append(total_len - start_pos) 
         return score_lists, np.asarray(ntoks_arr), random_int_list
@@ -661,7 +749,8 @@ class RSBHDecoder(MarylandDetector):
             message_length=self.gf_segments_num,   # n
             payload_length=self.segments_num,      # k
             symbol_size=self.segment_bit,          # m
-            p_factor=1
+            p_factor=1,
+            debug=False
         )
 
 
@@ -694,8 +783,12 @@ class RSBHDecoder(MarylandDetector):
         for ii in range(bsz):
             total_len = len(tokens_id[ii])
             start_pos = self.ngram +1
+            use_device_scoring = self._use_device_scoring()
             # aggr scores for each payload segments
-            rt_aggr_list = [torch.zeros(2 ** self.segment_bit) for i in range(self.gf_segments_num)]
+            if use_device_scoring:
+                rt_aggr_list = [torch.zeros(2 ** self.segment_bit, device=self.detect_device) for i in range(self.gf_segments_num)]
+            else:
+                rt_aggr_list = [torch.zeros(2 ** self.segment_bit) for i in range(self.gf_segments_num)]
             seen_ntuples = set()
             for cur_pos in range(start_pos, total_len):
                 ngram_tokens = tokens_id[ii][cur_pos-self.ngram:cur_pos] # h
@@ -709,8 +802,11 @@ class RSBHDecoder(MarylandDetector):
                     if tup_for_unique in seen_ntuples:
                         continue
                     seen_ntuples.add(tup_for_unique)
-                rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
-                rt = rt[:(2**self.segment_bit)] # rt: contribution of token t on each payloads
+                if use_device_scoring:
+                    rt = self.score_tok_candidates(ngram_tokens, tokens_id[ii][cur_pos], 2 ** self.segment_bit)
+                else:
+                    rt = self.score_tok(ngram_tokens, tokens_id[ii][cur_pos]) 
+                    rt = rt[:(2**self.segment_bit)] # rt: contribution of token t on each payloads
 
                 # determine the segment current token embeds using mapping
                 random_int = self.mapping[ngram_tokens[0]]
@@ -719,7 +815,7 @@ class RSBHDecoder(MarylandDetector):
                 random_int_list.append(random_int)
 
             for i in range(self.gf_segments_num):
-                score_lists[ii].append(rt_aggr_list[i].numpy())
+                score_lists[ii].append(rt_aggr_list[i].cpu().numpy())
             ntoks_arr.append(total_len - start_pos) 
         return score_lists, np.asarray(ntoks_arr), random_int_list
 

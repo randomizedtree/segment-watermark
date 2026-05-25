@@ -80,6 +80,7 @@ class WmGenerator():
         max_gen_len: int,
         temperature: float = 0.8,
         top_p: float = 0.95,
+        repetition_penalty: float = 1.0,
     ) -> List[str]:
         """
         Generate text from prompts. 
@@ -105,7 +106,15 @@ class WmGenerator():
                 tokens[:, prev_pos:cur_pos], use_cache=True, past_key_values=outputs.past_key_values if prev_pos > 0 else None
             ) # (bsz, tokens_len, vocab_size)
             ngram_tokens = tokens[:, cur_pos-self.ngram:cur_pos]
-            next_toks = self.sample_next(outputs.logits[:, -1, :], ngram_tokens, temperature, top_p)
+            previous_tokens = tokens[:, :cur_pos]
+            next_toks = self.sample_next(
+                outputs.logits[:, -1, :],
+                ngram_tokens,
+                temperature,
+                top_p,
+                previous_tokens=previous_tokens,
+                repetition_penalty=repetition_penalty,
+            )
             tokens[:, cur_pos] = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_toks) # only updates those with cur_pos is a padding token
             prev_pos = cur_pos
 
@@ -121,6 +130,36 @@ class WmGenerator():
             decoded.append(self.tokenizer.decode(t))
 
         return decoded
+
+    def apply_repetition_penalty(
+        self,
+        logits: torch.FloatTensor,
+        previous_tokens: torch.LongTensor,
+        repetition_penalty: float = 1.0,
+    ) -> torch.FloatTensor:
+        """Apply the standard repetition penalty to tokens already in the context."""
+        if previous_tokens is None or repetition_penalty == 1.0:
+            return logits
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be strictly positive")
+
+        logits = logits.clone()
+        vocab_size = logits.shape[-1]
+        for ii in range(logits.shape[0]):
+            token_ids = previous_tokens[ii]
+            token_ids = token_ids[(token_ids >= 0) & (token_ids < vocab_size)]
+            if self.pad_id is not None:
+                token_ids = token_ids[token_ids != self.pad_id]
+            if token_ids.numel() == 0:
+                continue
+            token_ids = torch.unique(token_ids)
+            token_logits = logits[ii, token_ids]
+            logits[ii, token_ids] = torch.where(
+                token_logits < 0,
+                token_logits * repetition_penalty,
+                token_logits / repetition_penalty,
+            )
+        return logits
     
     def sample_next(
         self,
@@ -128,8 +167,11 @@ class WmGenerator():
         ngram_tokens: torch.LongTensor, # (bsz, ngram): tokens to consider when seeding. i.e. for each batch, the ngrams for current pos 
         temperature: float = 0.8, # temperature for sampling
         top_p: float = 0.95, # top p for sampling
+        previous_tokens: torch.LongTensor = None,
+        repetition_penalty: float = 1.0,
     ) -> torch.LongTensor:
         """ Vanilla sampling with temperature and top p."""
+        logits = self.apply_repetition_penalty(logits, previous_tokens, repetition_penalty)
         if temperature > 0:
             probs = torch.softmax(logits / temperature, dim=-1)
             probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -159,6 +201,8 @@ class OpenaiGenerator(WmGenerator):
         ngram_tokens: torch.LongTensor, # (bsz, ngram): tokens to consider when seeding
         temperature: float = 0.8, # temperature for sampling
         top_p: float = 0.95, # top p for sampling
+        previous_tokens: torch.LongTensor = None,
+        repetition_penalty: float = 1.0,
     ) -> torch.LongTensor:
         """
         From ngram tokens, select the next token based on the following:
@@ -167,6 +211,7 @@ class OpenaiGenerator(WmGenerator):
         - select argmax ( r^(1/p) )
         payload (the message) is encoded by shifting the secret vector r by `payload`.
         """
+        logits = self.apply_repetition_penalty(logits, previous_tokens, repetition_penalty)
         if temperature > 0:
             probs = torch.softmax(logits / temperature, dim=-1)
             probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -211,6 +256,8 @@ class MarylandGenerator(WmGenerator):
         ngram_tokens: torch.LongTensor, # (bsz, ngram): tokens to consider when seeding
         temperature: float = 0.8, # temperature for sampling
         top_p: float = 0.95, # top p for sampling
+        previous_tokens: torch.LongTensor = None,
+        repetition_penalty: float = 1.0,
     ) -> torch.LongTensor:
         """
         From ngram tokens, select the next token based on the following:
@@ -220,6 +267,7 @@ class MarylandGenerator(WmGenerator):
         payload (the message) is encoded by shifting the secret vector r by `payload`.
         """
         logits = self.logits_processor(logits, ngram_tokens)
+        logits = self.apply_repetition_penalty(logits, previous_tokens, repetition_penalty)
         if temperature > 0:
             probs = torch.softmax(logits / temperature, dim=-1)
             probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
@@ -232,10 +280,7 @@ class MarylandGenerator(WmGenerator):
         else:
             next_token = torch.argmax(logits, dim=-1)
         next_token = next_token.reshape(-1)
-        if next_token == self.newline_idx:
-            self.is_slash_n = True
-        else:
-            self.is_slash_n = False
+        self.is_slash_n = bool((next_token == self.newline_idx).any().item())
         return next_token
 
     def logits_processor(self, logits, ngram_tokens):
@@ -359,7 +404,7 @@ class BCHGenerator(MarylandGenerator):
             seed = self.get_seed_rng(ngram_tokens[ii])
             self.rng.manual_seed(seed)
             # r_length will be vocab_size unless 2**self.segment_bits > vocab_size, usually satisfied under our exp
-            r_length = vocab_size
+            r_length = max(2 ** self.segment_bit, vocab_size)
             vocab_permutation = torch.randperm(r_length, generator=self.rng)
             greenlist = vocab_permutation[:int(self.gamma * r_length)] # gamma * payload_max, index of greenlist token
             bias = torch.zeros(r_length).to(logits.device) # payload_max
@@ -434,7 +479,8 @@ class RSGenerator(MarylandGenerator):
             message_length=self.gf_segments_num,
             payload_length=self.segments_num,
             symbol_size=self.segment_bit,
-            p_factor=1
+            p_factor=1,
+            debug=False
         )
 
         self.gf_segments = [int(i) for i in self.rs.encode(self.segments)]
@@ -447,7 +493,7 @@ class RSGenerator(MarylandGenerator):
             # generate r
             seed = self.get_seed_rng(ngram_tokens[ii])
             self.rng.manual_seed(seed)
-            r_length = vocab_size
+            r_length = max(2 ** self.segment_bit, vocab_size)
             vocab_permutation = torch.randperm(r_length, generator=self.rng)
             greenlist = vocab_permutation[:int(self.gamma * r_length)] # gamma * payload_max, index of greenlist token
             bias = torch.zeros(r_length).to(logits.device) # payload_max
@@ -519,7 +565,8 @@ class RSBHGenerator(MarylandGenerator):
             message_length=self.gf_segments_num,
             payload_length=self.segments_num,
             symbol_size=self.segment_bit,
-            p_factor=1
+            p_factor=1,
+            debug=False
         )
 
         self.gf_segments = [int(i) for i in self.rs.encode(self.segments)]
@@ -532,7 +579,7 @@ class RSBHGenerator(MarylandGenerator):
             # generate r
             seed = self.get_seed_rng(ngram_tokens[ii])
             self.rng.manual_seed(seed)
-            r_length = vocab_size
+            r_length = max(2 ** self.segment_bit, vocab_size)
             vocab_permutation = torch.randperm(r_length, generator=self.rng)
             greenlist = vocab_permutation[:int(self.gamma * r_length)] # gamma * payload_max, index of greenlist token
             bias = torch.zeros(r_length).to(logits.device) # payload_max

@@ -35,6 +35,7 @@ def get_args_parser():
     # generation parameters
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--top_p', type=float, default=0.95)
+    parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--max_gen_len', type=int, default=256)
 
     # watermark parameters
@@ -102,22 +103,24 @@ def get_args_parser():
 def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    random.seed(args.seed)
 
     # build model
-    if args.model_name == "llama-7b":
-        model_name = "huggyllama/llama-7b"
-        adapters_name = None
-    if args.model_name == "llama-chat-7b":
-        model_name = "daryl149/llama-2-7b-chat-hf"
-        adapters_name = None
-    elif args.model_name == 'guanaco':
-        model_name = "huggyllama/llama-7b"
-        adapters_name = "timdettmers/guanaco-7b"
-    elif args.model_name == 'falcon':
-        model_name = 'tiiuae/falcon-7b'
-        adapters_name = None
+    model_alias = {
+        "llama-7b": ("huggyllama/llama-7b", None),
+        "llama-chat-7b": ("daryl149/llama-2-7b-chat-hf", None),
+        "guanaco": ("huggyllama/llama-7b", "timdettmers/guanaco-7b"),
+        "falcon": ("tiiuae/falcon-7b", None),
+    }
+
+    if args.model_name in model_alias:
+        model_name, adapters_name = model_alias[args.model_name]
     else:
-        model_name = args.model_name
+        model_name = os.path.abspath(os.path.expanduser(args.model_name))
+        if not os.path.exists(model_name):
+            raise ValueError(
+                f"Unknown model alias: {args.model_name}. If using a local model path, make sure it exists. Got: {model_name}"
+            )
         adapters_name = None
     # elif args.model_name == 'vicuna':
     #     model_name = 'lmsys/vicuna-7b-v1.5'
@@ -208,7 +211,8 @@ def main(args):
                 prompts[ii:ii+chunk_size], 
                 max_gen_len=args.max_gen_len, 
                 temperature=args.temperature, 
-                top_p=args.top_p
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
             )
             time1 = time.time()
             # time chunk
@@ -230,11 +234,19 @@ def main(args):
             # change payload if payload_mode is random
             if args.payload_mode == 'random':
                 generator.set_payload(random.randint(0, args.payload_max - 1))
-    print(f"Average generation time per prompt: {np.sum(all_times) / (len(prompts) - start_point) :.2f}")
+    remaining_prompts = len(prompts) - start_point
+    if remaining_prompts > 0:
+        print(f"Average generation time per prompt: {np.sum(all_times) / remaining_prompts :.2f}")
+    else:
+        print("No new prompts generated; existing results.jsonl already covers this run.")
+
+    if not args.do_eval:
+        print("Skipping evaluation because --do_eval is false.")
+        return
 
     if args.method_detect == 'same':
         args.method_detect = args.method
-    if (not args.do_eval) or (args.method_detect not in ["openai", "maryland", "marylandz", "openaiz", "marylandE", "rs", "rsbh", "bch"]):
+    if args.method_detect not in ["openai", "maryland", "marylandz", "openaiz", "marylandE", "rs", "rsbh", "bch"]:
         raise ValueError('Unknown detect method!')
     
     # build watermark detector
@@ -271,34 +283,28 @@ def main(args):
         results_orig = results_orig[left:right]
 
     # evaluate
-    # evaluate
     results, corr_payloads = load_res_payload(json_path=os.path.join(args.output_dir, f"results.jsonl"), nsamples=args.nsamples, result_key="result")
-    
-    # === 新增：评分阶段的断点续传逻辑 ===
+
     score_start_point = 0
     score_file_path = os.path.join(args.output_dir, 'scores.jsonl')
     log_stats = []
     decoded_payloads = []
 
-    # 如果有历史评分，读取并恢复状态
     if os.path.exists(score_file_path):
         with open(score_file_path, 'r') as f:
             for line in f:
                 data = json.loads(line)
-                # 恢复 log_stats
                 short_log = {k: data[k] for k in ['text_index', 'num_token', 'score', 'payload'] if k in data}
                 if 'zscore' in data: short_log['zscore'] = data['zscore']
                 if 'pvalue' in data: short_log['pvalue'] = data['pvalue']
                 log_stats.append(short_log)
-                # 恢复 payloads
                 decoded_payloads.append(data['payload'])
                 score_start_point += 1
     print(f"Scoring starting from index {score_start_point}")
 
     text_index = (left if args.split is not None else 0) + score_start_point
     all_times = []
-    
-    # === 注意：将 'w' 覆盖模式改为了 'a' 追加模式，并切片跳过已经处理的数据 ===
+
     with open(score_file_path, 'a') as f:
         for text, text_orig in tqdm.tqdm(list(zip(results, results_orig))[score_start_point:]):
             time0 = time.time()

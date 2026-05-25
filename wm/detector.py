@@ -491,10 +491,13 @@ class BCHDecoder(MarylandDetector):
 
         self.BCH = BCH(self.n, self.k)
     
+    def _score_r_length(self) -> int:
+        return max(2 ** self.segment_bit, self.vocab_size)
+
     def score_tok(self, ngram_tokens, token_id):
         seed = self.get_seed_rng(ngram_tokens)
         self.rng.manual_seed(seed)
-        r_length = self.vocab_size
+        r_length = self._score_r_length()
         scores = torch.zeros(r_length) # scores tensor of all possible payloads
         vocab_permutation = torch.randperm(r_length, generator=self.rng)
         greenlist = vocab_permutation[:int(self.gamma * r_length)] # gamma * n toks in the greenlist
@@ -625,10 +628,13 @@ class RSDecoder(MarylandDetector):
             debug=False
         )
 
+    def _score_r_length(self) -> int:
+        return max(2 ** self.segment_bit, self.vocab_size)
+
     def score_tok(self, ngram_tokens, token_id):
         seed = self.get_seed_rng(ngram_tokens)
         self.rng.manual_seed(seed)
-        r_length = self.vocab_size
+        r_length = self._score_r_length()
         scores = torch.zeros(r_length) # scores tensor of all possible payloads
         vocab_permutation = torch.randperm(r_length, generator=self.rng)
         greenlist = vocab_permutation[:int(self.gamma * r_length)] # gamma * n toks in the greenlist
@@ -753,12 +759,13 @@ class RSBHDecoder(MarylandDetector):
             debug=False
         )
 
-
+    def _score_r_length(self) -> int:
+        return max(2 ** self.segment_bit, self.vocab_size)
 
     def score_tok(self, ngram_tokens, token_id):
         seed = self.get_seed_rng(ngram_tokens)
         self.rng.manual_seed(seed)
-        r_length = self.vocab_size
+        r_length = self._score_r_length()
         scores = torch.zeros(r_length) # scores tensor of all possible payloads
         vocab_permutation = torch.randperm(r_length, generator=self.rng)
         greenlist = vocab_permutation[:int(self.gamma * r_length)] # gamma * n toks in the greenlist
